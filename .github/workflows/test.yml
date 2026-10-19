@@ -50,8 +50,11 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install dependencies
-        run: npm install
+        run: bun install --frozen-lockfile
 
       - name: Build JavaScript package
-        run: npm run build
+        run: bun run build
