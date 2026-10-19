@@ -5,7 +5,7 @@ import UIKit
 import WebKit
 
 @_cdecl("init_plugin_share") 
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
     return SharePlugin()
 }
 
