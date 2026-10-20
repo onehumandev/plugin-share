@@ -50,6 +50,11 @@ class ShareOptions {
 
 @TauriPlugin
 class SharePlugin(private val activity: Activity): Plugin(activity) {
+    // Tauri invokes commands on a background thread while lifecycle callbacks
+    // (onPause/onResume) and activity results arrive on the main thread, so all
+    // share state below is guarded by `lock`.
+    private val lock = Any()
+    private var isStaging = false
     private var pendingShareInvoke: Invoke? = null
     private var pendingCleanupFiles: List<File> = emptyList()
     private val shareSession = ShareSessionState()
@@ -57,6 +62,14 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
 
     companion object {
         private const val CLEANUP_DELAY_MS = 5 * 60 * 1000L
+        private const val DEFAULT_MIME_TYPE = "application/octet-stream"
+    }
+
+    private class StagedFiles {
+        val uris = ArrayList<Uri>()
+        val mimeTypes = ArrayList<String>()
+        /** Files created by the plugin that must be deleted once sharing finishes. */
+        val ownedFiles = ArrayList<File>()
     }
 
     @Command
@@ -70,133 +83,66 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
 
     @Command
     fun share(invoke: Invoke) {
-        if (shareSession.isInProgress) {
-            invoke.reject("Share already in progress.")
-            return
+        synchronized(lock) {
+            if (isStaging || shareSession.isInProgress) {
+                invoke.reject("Share already in progress.")
+                return
+            }
+            isStaging = true
         }
 
-        val filesForShare = ArrayList<File>()
+        val staged = StagedFiles()
+        val chooser: Intent
         try {
             val args = invoke.parseArgs(ShareOptions::class.java)
             ShareValidation.validateShareOptions(args)
-            val fileUris = ArrayList<Uri>()
-            val mimeTypes = ArrayList<String>()
-            val authority = "${activity.packageName}.fileprovider"
+            // Decoding and copying run on the calling (non-main) thread.
+            stageFiles(args, staged)
 
-            args.files?.let {
-                if (it.isNotEmpty()) {
-                    for (file in it) {
-                        val decodedBytes = Base64.decode(file.data, Base64.DEFAULT)
-                        ShareValidation.validateDecodedFileSize(file, decodedBytes.size)
-                        val tempFile = createSafeFile(file.name)
-                        FileOutputStream(tempFile).use { outputStream ->
-                            outputStream.write(decodedBytes)
-                        }
-                        filesForShare.add(tempFile)
-
-                        fileUris.add(
-                            FileProvider.getUriForFile(activity, authority, tempFile)
-                        )
-                        mimeTypes.add(file.mimeType)
-                    }
-                }
-            }
-
-            args.filePaths?.let {
-                if (it.isNotEmpty()) {
-                    for (path in it) {
-                        val file = File(path)
-                        if (!file.exists() || !file.isFile) {
-                            throw SecurityException("File does not exist or is not a regular file: $path")
-                        }
-
-                        // Prefer sharing directly through the caller's FileProvider.
-                        // If the file is outside a declared root, copy it to the plugin's
-                        // cache share directory and share from there.
-                        val shareFile = try {
-                            FileProvider.getUriForFile(activity, authority, file)
-                            file
-                        } catch (e: IllegalArgumentException) {
-                            val safeFile = copyToSafeShareDir(file)
-                            filesForShare.add(safeFile)
-                            safeFile
-                        }
-
-                        fileUris.add(
-                            FileProvider.getUriForFile(activity, authority, shareFile)
-                        )
-                        mimeTypes.add(
-                            URLConnection.guessContentTypeFromName(shareFile.name)
-                                ?: "application/octet-stream"
-                        )
-                    }
-                }
-            }
-
-            var determinedMimeType = "text/plain"
-            if (mimeTypes.isNotEmpty()) {
-                determinedMimeType = determineMimeType(mimeTypes)
-            }
-
-            if (fileUris.isEmpty() && args.text.isNullOrEmpty() && args.url.isNullOrEmpty()) {
+            val payload = ShareIntentPayload.from(args)
+            if (staged.uris.isEmpty() && payload.body == null) {
+                cleanupFiles(staged.ownedFiles)
+                synchronized(lock) { isStaging = false }
                 invoke.reject("No content provided to share.")
                 return
             }
 
-            val shareIntent = Intent()
-            if (fileUris.isNotEmpty()) {
-                shareIntent.action = if (fileUris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
-                if (fileUris.size > 1) {
-                    shareIntent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, fileUris)
-                } else {
-                    shareIntent.putExtra(Intent.EXTRA_STREAM, fileUris[0])
-                }
-
-                shareIntent.clipData = createShareClipData(fileUris)
-            } else {
-                shareIntent.action = Intent.ACTION_SEND
-            }
-
-            shareIntent.type = determinedMimeType
-
-            val payload = ShareIntentPayload.from(args)
-            payload.body?.let {
-                shareIntent.putExtra(Intent.EXTRA_TEXT, it)
-            }
-            payload.title?.let {
-                shareIntent.putExtra(Intent.EXTRA_TITLE, it)
-                shareIntent.putExtra(Intent.EXTRA_SUBJECT, it)
-            }
-
-            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            val chooser = Intent.createChooser(shareIntent, payload.title)
-
-            pendingShareInvoke = invoke
-            pendingCleanupFiles = filesForShare
-            shareSession.start()
-            startActivityForResult(invoke, chooser, "shareResult")
+            chooser = buildChooserIntent(staged, payload)
         } catch (e: Exception) {
-            cleanupFiles(filesForShare)
-            resetPendingShare()
+            cleanupFiles(staged.ownedFiles)
+            synchronized(lock) { isStaging = false }
             invoke.reject("Failed to share content: ${e.message}", e)
+            return
         }
+
+        synchronized(lock) {
+            isStaging = false
+            pendingShareInvoke = invoke
+            pendingCleanupFiles = staged.ownedFiles
+            shareSession.start()
+        }
+        launchChooser(invoke, chooser)
     }
 
     override fun onPause() {
         super.onPause()
-        shareSession.markPaused()
+        synchronized(lock) {
+            shareSession.markPaused()
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        if (shareSession.completeFromResume()) {
+        val completed = synchronized(lock) { shareSession.completeFromResume() }
+        if (completed) {
             resolvePendingShare()
         }
     }
 
     @ActivityCallback
     fun shareResult(invoke: Invoke, result: ActivityResult) {
-        if (shareSession.completeFromActivityResult()) {
+        val completed = synchronized(lock) { shareSession.completeFromActivityResult() }
+        if (completed) {
             resolvePendingShare(invoke)
         }
     }
@@ -207,17 +153,120 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
      */
     @Command
     fun cleanup(invoke: Invoke) {
-        try {
-            val shareDir = getSafeShareDir()
-            if (shareDir.exists() && shareDir.isDirectory) {
-                if (!shareDir.deleteRecursively()) {
-                    invoke.reject("Failed to delete all temporary share files.")
-                    return
-                }
+        synchronized(lock) {
+            if (isStaging || shareSession.isInProgress) {
+                invoke.reject("Cannot cleanup while sharing is in progress.")
+                return
             }
-            invoke.resolve()
-        } catch (e: Exception) {
-            invoke.reject("Error during cleanup: ${e.message}", e)
+            try {
+                val shareDir = getSafeShareDir()
+                if (shareDir.exists() && shareDir.isDirectory) {
+                    if (!shareDir.deleteRecursively()) {
+                        invoke.reject("Failed to delete all temporary share files.")
+                        return
+                    }
+                }
+            } catch (e: Exception) {
+                invoke.reject("Error during cleanup: ${e.message}", e)
+                return
+            }
+        }
+        invoke.resolve()
+    }
+
+    /** Writes Base64 files and resolves file paths into shareable content URIs. */
+    @Throws(IOException::class, SecurityException::class)
+    private fun stageFiles(args: ShareOptions, staged: StagedFiles) {
+        val authority = ShareFileProvider.authority(activity)
+
+        args.files?.forEach { file ->
+            val decodedBytes = Base64.decode(
+                ShareValidation.stripBase64Whitespace(file.data),
+                Base64.DEFAULT
+            )
+            ShareValidation.validateDecodedFileSize(file, decodedBytes.size)
+            val tempFile = createSafeFile(file.name)
+            staged.ownedFiles.add(tempFile)
+            FileOutputStream(tempFile).use { outputStream ->
+                outputStream.write(decodedBytes)
+            }
+
+            staged.uris.add(FileProvider.getUriForFile(activity, authority, tempFile))
+            staged.mimeTypes.add(file.mimeType.ifEmpty { DEFAULT_MIME_TYPE })
+        }
+
+        args.filePaths?.forEach { path ->
+            val file = File(path)
+            if (!file.exists() || !file.isFile) {
+                throw SecurityException("File does not exist or is not a regular file: $path")
+            }
+
+            // Prefer sharing directly through the plugin's FileProvider.
+            // If the file is outside a declared root, copy it to the plugin's
+            // cache share directory and share from there.
+            val shareUri = try {
+                FileProvider.getUriForFile(activity, authority, file)
+            } catch (e: IllegalArgumentException) {
+                val safeFile = copyToSafeShareDir(file)
+                staged.ownedFiles.add(safeFile)
+                FileProvider.getUriForFile(activity, authority, safeFile)
+            }
+
+            staged.uris.add(shareUri)
+            staged.mimeTypes.add(
+                URLConnection.guessContentTypeFromName(file.name) ?: DEFAULT_MIME_TYPE
+            )
+        }
+    }
+
+    private fun buildChooserIntent(staged: StagedFiles, payload: ShareIntentPayload): Intent {
+        val fileUris = staged.uris
+        val shareIntent = Intent()
+        if (fileUris.isNotEmpty()) {
+            shareIntent.action = if (fileUris.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
+            if (fileUris.size > 1) {
+                shareIntent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, fileUris)
+            } else {
+                shareIntent.putExtra(Intent.EXTRA_STREAM, fileUris[0])
+            }
+
+            shareIntent.clipData = createShareClipData(fileUris)
+        } else {
+            shareIntent.action = Intent.ACTION_SEND
+        }
+
+        shareIntent.type = if (staged.mimeTypes.isNotEmpty()) {
+            determineMimeType(staged.mimeTypes)
+        } else {
+            "text/plain"
+        }
+
+        payload.body?.let {
+            shareIntent.putExtra(Intent.EXTRA_TEXT, it)
+        }
+        payload.title?.let {
+            shareIntent.putExtra(Intent.EXTRA_TITLE, it)
+            shareIntent.putExtra(Intent.EXTRA_SUBJECT, it)
+        }
+
+        shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        return Intent.createChooser(shareIntent, payload.title)
+    }
+
+    /** Launches the chooser on the main thread; commands arrive on a background thread. */
+    private fun launchChooser(invoke: Invoke, chooser: Intent) {
+        activity.runOnUiThread {
+            try {
+                startActivityForResult(invoke, chooser, "shareResult")
+            } catch (e: Exception) {
+                val filesToClean = synchronized(lock) {
+                    val files = pendingCleanupFiles
+                    resetPendingShareLocked()
+                    files
+                }
+                cleanupFiles(filesToClean)
+                invoke.reject("Failed to share content: ${e.message}", e)
+            }
         }
     }
 
@@ -243,15 +292,20 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
         return clipData
     }
 
-    private fun resolvePendingShare(invoke: Invoke? = pendingShareInvoke) {
-        val filesToClean = pendingCleanupFiles
-        pendingShareInvoke = null
-        pendingCleanupFiles = emptyList()
+    private fun resolvePendingShare(invoke: Invoke? = null) {
+        val (pendingInvoke, filesToClean) = synchronized(lock) {
+            val pending = pendingShareInvoke
+            val files = pendingCleanupFiles
+            pendingShareInvoke = null
+            pendingCleanupFiles = emptyList()
+            Pair(pending, files)
+        }
         scheduleCleanup(filesToClean)
-        invoke?.resolve()
+        (invoke ?: pendingInvoke)?.resolve()
     }
 
-    private fun resetPendingShare() {
+    /** Must be called while holding [lock]. */
+    private fun resetPendingShareLocked() {
         pendingShareInvoke = null
         pendingCleanupFiles = emptyList()
         shareSession.reset()
@@ -266,10 +320,17 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
     }
 
     private fun cleanupFiles(files: List<File>) {
+        val shareDir = File(activity.cacheDir, "shares")
         files.forEach { file ->
             try {
                 if (file.exists()) {
                     file.delete()
+                }
+                // Copied files live in a per-file UUID subdirectory; remove it once empty.
+                val parent = file.parentFile
+                if (parent != null && parent.canonicalPath != shareDir.canonicalPath) {
+                    ensureInside(shareDir, parent)
+                    parent.delete()
                 }
             } catch (_: Exception) {
                 // Best-effort cleanup only.
@@ -290,45 +351,47 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
     }
 
     /**
+     * Path traversal check: ensures the resolved path of [file] is strictly inside [dir].
+     */
+    @Throws(IOException::class, SecurityException::class)
+    private fun ensureInside(dir: File, file: File) {
+        if (!file.canonicalPath.startsWith(dir.canonicalPath + File.separator)) {
+            throw SecurityException("Path Traversal Attack Detected. Malicious filename: '${file.name}'")
+        }
+    }
+
+    /**
      * Creates a safe File object within the dedicated share directory.
-     * It sanitizes the filename and performs path traversal checks.
+     * Only the final path component of the name is kept, and each file gets its
+     * own UUID subdirectory so the original filename is preserved without collisions.
      */
     @Throws(IOException::class, SecurityException::class)
     private fun createSafeFile(untrustedFileName: String): File {
         val safeDir = getSafeShareDir()
-        val safeDirCanonicalPath = safeDir.canonicalPath
 
-        // Sanitize the filename to prevent malicious characters.
-        // A robust approach is to allow only a whitelist of characters.
-        // Here, we also add a UUID to prevent name collisions.
-        val sanitizedBaseName = untrustedFileName.replace(Regex("[^a-zA-Z0-9._-]"), "")
-        if (sanitizedBaseName.isEmpty()) {
-            throw SecurityException("Invalid filename: sanitized name is empty.")
+        val baseName = File(untrustedFileName).name
+        if (baseName.isEmpty() || baseName == "." || baseName == "..") {
+            throw SecurityException("Invalid filename: '$untrustedFileName'.")
         }
 
-        val finalFileName = "${UUID.randomUUID()}-${sanitizedBaseName}"
-
-        val intendedFile = File(safeDir, finalFileName)
-
-        // CRITICAL: Path Traversal Check
-        // Ensure the final resolved path is still inside our secure directory.
-        if (!intendedFile.canonicalPath.startsWith(safeDirCanonicalPath + File.separator)) {
-            throw SecurityException("Path Traversal Attack Detected. Malicious filename: '$untrustedFileName'")
+        val uniqueDir = File(safeDir, UUID.randomUUID().toString())
+        if (!uniqueDir.mkdirs()) {
+            throw IOException("Failed to create share subdirectory.")
         }
-
+        val intendedFile = File(uniqueDir, baseName)
+        ensureInside(safeDir, intendedFile)
         return intendedFile
     }
 
     /**
      * Copies an existing file into the dedicated share directory in the app's cache.
      * A unique subdirectory is used so the original filename is preserved while
-     * avoiding name collisions, and the app's FileProvider (which only exposes
+     * avoiding name collisions, and the plugin's FileProvider (which only exposes
      * cache/shares/) can grant URIs for the copy.
      */
     @Throws(IOException::class, SecurityException::class)
     private fun copyToSafeShareDir(source: File): File {
         val safeDir = getSafeShareDir()
-        val safeDirCanonicalPath = safeDir.canonicalPath
 
         // Use a unique subdirectory for each copied file to avoid collisions
         // and to keep the original filename intact for target apps.
@@ -338,14 +401,14 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
         }
 
         val dest = File(uniqueDir, source.name)
-
-        // CRITICAL: Path Traversal Check
-        // Ensure the final resolved path is still inside our secure directory.
-        if (!dest.canonicalPath.startsWith(safeDirCanonicalPath + File.separator)) {
-            throw SecurityException("Path Traversal Attack Detected. Malicious filename: '${source.name}'")
+        try {
+            ensureInside(safeDir, dest)
+            source.copyTo(dest, overwrite = true)
+        } catch (e: Exception) {
+            dest.delete()
+            uniqueDir.delete()
+            throw e
         }
-
-        source.copyTo(dest, overwrite = true)
         return dest
     }
 }
