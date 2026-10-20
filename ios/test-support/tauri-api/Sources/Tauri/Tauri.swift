@@ -1,5 +1,8 @@
 import Foundation
 import WebKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public typealias JsonObject = [String: Any?]
 
@@ -14,7 +17,11 @@ open class Plugin: NSObject {
 }
 
 open class PluginManager: NSObject {
+#if canImport(UIKit)
+    public var viewController: UIViewController?
+#else
     public var viewController: AnyObject?
+#endif
 }
 
 open class Invoke: NSObject {
