@@ -12,20 +12,19 @@ use crate::platform;
 pub struct Share<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> Share<R> {
+    /// Shows the native share dialog and blocks until it is dismissed.
+    ///
+    /// Call this from a blocking context (for example `spawn_blocking`), not
+    /// directly on an async runtime worker or the main thread.
     pub fn share(
         &self,
         window: Window<R>,
         options: ShareOptions,
         state: State<'_, PluginTempFileManager>,
     ) -> Result<()> {
-        if !options.has_shareable_content() {
-            return Err(crate::Error::InvalidArgs(
-                "No content provided to share.".to_string(),
-            ));
-        }
-        options.validate()?;
-
-        platform::share(window, options, state)
+        let options = prepare_share_options(options)?;
+        let _active_share = state.begin_share();
+        platform::share(window, options, state.inner())
     }
 
     pub fn can_share(&self) -> Result<CanShareResult> {
@@ -33,10 +32,12 @@ impl<R: Runtime> Share<R> {
     }
 
     pub fn cleanup(&self) -> Result<()> {
-        self.0
-            .state::<PluginTempFileManager>()
-            .cleanup_all_managed_files();
-        platform::cleanup()
+        let state = self.0.state::<PluginTempFileManager>();
+        if state.is_sharing() {
+            return Err(crate::Error::ShareInProgress);
+        }
+        state.cleanup_all_managed_files();
+        Ok(())
     }
 }
 

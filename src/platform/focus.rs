@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
@@ -72,6 +72,9 @@ struct FocusWaiter {
     pending: Mutex<Option<mpsc::Sender<()>>>,
     state: Mutex<FocusState>,
     listener_registered: AtomicBool,
+    /// Incremented for every share so a grace timer from an earlier share
+    /// cannot complete a later one.
+    generation: AtomicU64,
 }
 
 impl FocusWaiter {
@@ -81,6 +84,7 @@ impl FocusWaiter {
             pending: Mutex::new(None),
             state: Mutex::new(FocusState::new()),
             listener_registered: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -88,9 +92,16 @@ impl FocusWaiter {
 pub struct FocusWaitHandle {
     waiter: Arc<FocusWaiter>,
     rx: mpsc::Receiver<()>,
+    generation: u64,
 }
 
 impl FocusWaitHandle {
+    /// Starts the grace period after which the share completes if the window
+    /// never lost focus. Call it once the share UI has received its data.
+    pub fn start_grace_timer(&self) {
+        spawn_focus_grace_timer(self.waiter.clone(), self.generation);
+    }
+
     pub fn wait(self) -> Result<(), Error> {
         match self.rx.recv_timeout(FOCUS_WAIT_TIMEOUT) {
             Ok(()) => {}
@@ -121,13 +132,16 @@ pub fn begin_focus_wait<R: Runtime>(window: &Window<R>) -> Result<FocusWaitHandl
         }
         *pending = Some(tx);
     }
+    let generation = waiter.generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut state) = waiter.state.lock() {
         state.reset();
     }
 
-    spawn_focus_grace_timer(waiter.clone());
-
-    Ok(FocusWaitHandle { waiter, rx })
+    Ok(FocusWaitHandle {
+        waiter,
+        rx,
+        generation,
+    })
 }
 
 fn clear_pending(waiter: &FocusWaiter) {
@@ -186,9 +200,12 @@ fn should_complete_on_destroy(waiter: &FocusWaiter) -> bool {
     state.on_destroyed()
 }
 
-fn spawn_focus_grace_timer(waiter: Arc<FocusWaiter>) {
+fn spawn_focus_grace_timer(waiter: Arc<FocusWaiter>, generation: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(FOCUS_WAIT_GRACE);
+        if waiter.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
         let should_complete = {
             let mut state = match waiter.state.lock() {
                 Ok(state) => state,

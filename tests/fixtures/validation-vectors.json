@@ -1,0 +1,56 @@
+{
+  "_comment": "Shared validation vectors. Rust (tests/validation_vectors.rs), TypeScript (tests/js), Kotlin (android/src/test) and Swift (ios/Tests) must all agree with every case.",
+  "urls": [
+    { "url": "https://example.com", "valid": true },
+    { "url": "http://example.com", "valid": true },
+    { "url": "HTTPS://EXAMPLE.COM/Path", "valid": true },
+    { "url": "https://my_host.example.com", "valid": true },
+    { "url": "https://example.com:8080/path?q=1#frag", "valid": true },
+    { "url": "https://user:pass@example.com/", "valid": true },
+    { "url": "https://[::1]:8443/", "valid": true },
+    { "url": "https://example.com/a|b{c}", "valid": true },
+    { "url": "https://例え.jp/パス", "valid": true },
+    { "url": "file:///etc/passwd", "valid": false },
+    { "url": "content://provider/item", "valid": false },
+    { "url": "custom-scheme://value", "valid": false },
+    { "url": "mailto:someone@example.com", "valid": false },
+    { "url": "javascript:alert(1)", "valid": false },
+    { "url": "https://", "valid": false },
+    { "url": "https:///missing-host", "valid": false },
+    { "url": "https://:443/", "valid": false },
+    { "url": "https://[]/", "valid": false },
+    { "url": "https://user@/", "valid": false },
+    { "url": " https://example.com", "valid": false },
+    { "url": "https://example.com ", "valid": false },
+    { "url": "https://exa mple.com", "valid": false },
+    { "url": "https://example.com\nhttps://evil.example", "valid": false },
+    { "url": "https://example.com\t", "valid": false },
+    { "url": "https://example.com\u0000", "valid": false },
+    { "url": "https://example.com\u007f", "valid": false },
+    { "url": "https://example.com\u0085", "valid": false },
+    { "url": "https://example.com\u009f", "valid": false },
+    { "url": "https://example.com ", "valid": false },
+    { "url": "https://example.com ", "valid": false }
+  ],
+  "base64": [
+    { "data": "", "decodedBytes": 0 },
+    { "data": "aGVsbG8=", "decodedBytes": 5 },
+    { "data": "aGVsbG8h", "decodedBytes": 6 },
+    { "data": "aGVsbA==", "decodedBytes": 4 },
+    { "data": "aGVs\nbG8=", "decodedBytes": 5 },
+    { "data": "aGVs\r\nbG8=\n", "decodedBytes": 5 },
+    { "data": " aGVs bG8= ", "decodedBytes": 5 },
+    { "data": "aGVsbG8", "valid": false },
+    { "data": "aGVsbG8===", "valid": false },
+    { "data": "a===", "valid": false }
+  ],
+  "filePaths": [
+    { "path": "/tmp/report.pdf", "posixValid": true },
+    { "path": "/Users/me/My Files/ünïcode name.txt", "posixValid": true },
+    { "path": "", "posixValid": false },
+    { "path": "relative/report.pdf", "posixValid": false },
+    { "path": "./report.pdf", "posixValid": false },
+    { "path": "file:///tmp/report.pdf", "posixValid": false },
+    { "path": "content://provider/item", "posixValid": false }
+  ]
+}

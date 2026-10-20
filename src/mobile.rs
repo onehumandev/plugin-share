@@ -40,12 +40,7 @@ impl<R: Runtime> Share<R> {
         payload: ShareOptions,
         _state: State<'_, PluginTempFileManager>,
     ) -> Result<()> {
-        if !payload.has_shareable_content() {
-            return Err(crate::Error::InvalidArgs(
-                "No content provided to share.".to_string(),
-            ));
-        }
-        payload.validate()?;
+        let payload = prepare_share_options(payload)?;
 
         self.0
             .run_mobile_plugin("share", payload)

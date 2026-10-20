@@ -1,7 +1,6 @@
 use raw_window_handle::HandleError;
 use serde::Serialize;
 use std::sync::mpsc::RecvError;
-use tempfile::PathPersistError;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -18,12 +17,12 @@ pub enum Error {
     NativeApi(String),
     #[error("Temporary file operation failed: {0}")]
     TempFile(String),
+    #[error("Cannot cleanup while sharing is in progress.")]
+    ShareInProgress,
     #[error("Tauri API error: {0}")]
     Tauri(#[from] tauri::Error),
     #[error("Failed to receive from channel: {0}")]
     Recv(#[from] RecvError),
-    #[error("File persistence error: {0}")]
-    FilePersist(String),
     #[error("Failed to get window handle: {0}")]
     Handle(#[from] HandleError),
     #[error(transparent)]
@@ -39,11 +38,5 @@ impl Serialize for Error {
         S: serde::Serializer,
     {
         serializer.serialize_str(self.to_string().as_ref())
-    }
-}
-
-impl From<PathPersistError> for Error {
-    fn from(err: PathPersistError) -> Self {
-        Error::FilePersist(format!("Failed to persist temporary file: {}", err))
     }
 }
