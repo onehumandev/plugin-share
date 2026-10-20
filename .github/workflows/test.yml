@@ -9,6 +9,9 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ${{ matrix.os }}
@@ -27,16 +30,13 @@ jobs:
           sudo apt-get install -y webkit2gtk-4.1 libxdo-dev libayatana-appindicator3-dev
 
       - name: Set up Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Check build on ${{ matrix.os }}
         run: cargo check --all-targets
 
       - name: Run Rust tests on ${{ matrix.os }}
-        run: cargo test --lib
+        run: cargo test --all-targets
 
   javascript:
     runs-on: ubuntu-latest
@@ -58,3 +58,45 @@ jobs:
 
       - name: Build JavaScript package
         run: bun run build
+
+      - name: Check the committed global API build is up to date
+        run: git diff --exit-code -- api-iife.js
+
+      - name: Run JavaScript tests
+        run: bun run test
+
+      - name: Type-check JavaScript package and tests
+        run: bun run test:types
+
+  ios:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Swift tests
+        working-directory: ios
+        run: VNIDROP_SHARE_USE_TAURI_STUB=1 swift test
+
+  android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.5.1"
+
+      - name: Run Android unit tests
+        working-directory: android
+        run: gradle testDebugUnitTest

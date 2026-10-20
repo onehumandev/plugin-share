@@ -9,8 +9,57 @@ on:
   # an already-published release tag. Run this workflow against the tag ref.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      npm-tag: ${{ steps.version.outputs.npm-tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the package versions
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::Run this workflow against a release tag, not $GITHUB_REF."
+            exit 1
+          fi
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          npm_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$cargo_version" ] || [ "$tag_version" != "$npm_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml ($cargo_version) and package.json ($npm_version)."
+            exit 1
+          fi
+          # Prereleases go to the `next` dist-tag so `npm install` keeps resolving to a stable release.
+          if [[ "$tag_version" == *-* ]]; then
+            echo "npm-tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm-tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y webkit2gtk-4.1 libxdo-dev libayatana-appindicator3-dev
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust tests
+        run: cargo test --all-targets
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build and test the JavaScript package
+        run: |
+          bun run build
+          git diff --exit-code -- api-iife.js
+          bun run test
+          bun run test:types
+
   publish-crate-dry-run:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,10 +68,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y webkit2gtk-4.1 libxdo-dev libayatana-appindicator3-dev
       - name: Set up Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
       - name: Run cargo publish dry-run
         uses: katyo/publish-crates@v2
         with:
@@ -30,22 +76,25 @@ jobs:
           dry-run: true
 
   publish-npm-dry-run:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Node.js and pnpm
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install -g pnpm
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
       - name: Install dependencies
-        run: pnpm i
+        run: bun install --frozen-lockfile
       - name: Build the plugin
-        run: pnpm build
+        run: bun run build
       - name: Run npm publish dry-run
         uses: JS-DevTools/npm-publish@v3
         with:
           token: ${{ secrets.NPM_TOKEN }}
+          tag: ${{ needs.verify.outputs.npm-tag }}
           dry-run: true
 
   publish-crate:
@@ -58,31 +107,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y webkit2gtk-4.1 libxdo-dev libayatana-appindicator3-dev
       - name: Set up Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
       - name: Publish to crates.io
         uses: katyo/publish-crates@v2
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+  # Runs after the crate so a failed crate publish never leaves an npm release
+  # without its matching Rust crate.
   publish-npm:
-    needs: [publish-crate-dry-run, publish-npm-dry-run]
+    needs: [verify, publish-crate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Node.js and pnpm
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install -g pnpm
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
       - name: Install dependencies
-        run: pnpm i
+        run: bun install --frozen-lockfile
       - name: Build the plugin
-        run: pnpm build
+        run: bun run build
       - name: Publish to npm
         uses: JS-DevTools/npm-publish@v3
         with:
           token: ${{ secrets.NPM_TOKEN }}
           access: public
+          tag: ${{ needs.verify.outputs.npm-tag }}
