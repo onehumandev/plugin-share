@@ -1,7 +1,7 @@
+use super::temp_files::stage_files;
 use crate::models::CanShareResult;
 use crate::state::PluginTempFileManager;
-use crate::{Error, ShareOptions, SharedFile, MAX_FILE_BYTES};
-use base64::{engine::general_purpose, Engine as _};
+use crate::{Error, ShareOptions};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::Message;
 use objc2::{
@@ -19,15 +19,15 @@ use objc2_foundation::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, WindowHandle};
 use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
-use std::{io::Write, path::Path, sync::mpsc};
-use tauri::{Runtime, State, Window};
-use tempfile::{Builder, NamedTempFile};
+use tauri::{Runtime, Window};
 
 const SHARE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 
 thread_local! {
-    static ACTIVE_DELEGATES: RefCell<Vec<Retained<SharePickerDelegate>>> = RefCell::new(Vec::new());
+    static ACTIVE_DELEGATES: RefCell<Vec<Retained<SharePickerDelegate>>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Default)]
@@ -128,169 +128,128 @@ fn remove_active_delegate(delegate: &SharePickerDelegate) {
     });
 }
 
-pub fn cleanup() -> Result<(), Error> {
-    // macOS file cleanup is handled by the shared `PluginTempFileManager` in desktop::Share::cleanup
-    // and on plugin drop. Nothing additional is required here.
-    Ok(())
-}
-
 pub fn can_share() -> Result<CanShareResult, Error> {
     // On macOS, we can always share as long as the sharing service is available.
     Ok(CanShareResult { value: true })
 }
 
 /// Shares content using the native macOS sharing service.
+///
+/// Resolves when a service reports success, when the picker is dismissed
+/// without choosing a service, or after `SHARE_COMPLETION_TIMEOUT` if the
+/// chosen service never reports back.
 pub fn share<R: Runtime>(
     window: Window<R>,
     options: ShareOptions,
-    state: State<'_, PluginTempFileManager>,
+    state: &PluginTempFileManager,
 ) -> Result<(), Error> {
+    // Decode and write files here, on the calling thread, so the main thread
+    // only builds and shows the picker.
+    let temp_paths = stage_files(options.files.as_deref(), state)?;
+
     let (setup_tx, setup_rx) = mpsc::channel();
     let (completion_tx, completion_rx) = mpsc::channel();
     let window_clone = window.clone();
 
-    let managed_files = state.inner().managed_files.clone();
-
-    if let Err(e) = window.run_on_main_thread(move || {
-        let result = (|| -> Result<(), Error> {
-            let ns_view = get_ns_view(&window_clone)?;
-            let mut items_to_share: Vec<Retained<NSObject>> = Vec::new();
-
-            let temp_file_manager_clone = managed_files.clone();
-
-            let has_files = options.files.as_ref().is_some_and(|f| !f.is_empty())
-                || options.file_paths.as_ref().is_some_and(|p| !p.is_empty());
-
-            let subject = if has_files {
-                options
-                    .title
-                    .as_ref()
-                    .or(options.text.as_ref())
-                    .map(|s| NSString::from_str(s))
-            } else {
-                None
-            };
-
-            if !has_files {
-                if let Some(url) = options.url.as_deref().filter(|value| !value.is_empty()) {
-                    if let Some(url_obj) = unsafe { NSURL::URLWithString(&NSString::from_str(url)) } {
-                        items_to_share.push(unsafe { Retained::cast_unchecked(url_obj) });
-                    }
-                }
-
-                if let Some(text) = options.text.as_deref().filter(|value| !value.is_empty()) {
-                    items_to_share.push(unsafe {
-                        Retained::cast_unchecked(NSString::from_str(text))
-                    });
-                }
-            }
-
-            if let Some(files) = options.files {
-                for file in files {
-                    let temp_file_named = create_temp_file_for_data(&file)?;
-                    let temp_path = temp_file_named.into_temp_path();
-                    let path_buf = temp_path.keep()?;
-
-                    let path_str = path_buf.to_string_lossy().to_string();
-                    let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(&path_str)) };
-                    items_to_share.push(unsafe { Retained::cast_unchecked(url) });
-
-                    if let Err(e) = temp_file_manager_clone
-                        .lock()
-                        .map_err(|e| format!("Failed to lock mutex: {}", e))
-                        .and_then(|mut files| {
-                            files.push(path_buf);
-                            Ok(())
-                        })
-                    {
-                        log::error!("Failed to add file to managed list: {}", e);
-                    }
-                }
-            }
-
-            // Share local files directly from their original paths. This preserves the
-            // original filename and avoids creating temporary copies.
-            if let Some(file_paths) = options.file_paths {
-                for path in file_paths {
-                    let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
-                    items_to_share.push(unsafe { Retained::cast_unchecked(url) });
-                }
-            }
-
-            if items_to_share.is_empty() {
-                return Err(Error::InvalidArgs(
-                    "No content provided to share.".to_string(),
-                ));
-            }
-
-            autoreleasepool(|_pool| {
-                let objects_refs: Vec<&AnyObject> = items_to_share
-                    .iter()
-                    .map(|obj| obj.as_ref() as &AnyObject)
-                    .collect();
-                let items_array = NSArray::from_slice(&objects_refs);
-                let picker = unsafe {
-                    NSSharingServicePicker::initWithItems(
-                        NSSharingServicePicker::alloc(),
-                        &*items_array,
-                    )
-                };
-
-                let mtm = MainThreadMarker::new().expect("Main thread marker");
-                let delegate = SharePickerDelegate::new(mtm, completion_tx, subject);
-                ACTIVE_DELEGATES.with(|delegates| delegates.borrow_mut().push(delegate.retain()));
-                unsafe { picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
-
-                let bounds = ns_view.bounds();
-                // Web-viewport coordinates are top-left origin; AppKit bounds use a bottom-left origin.
-                // Flip the y-axis so the anchor rect describes the same visual area in NSView space.
-                let rect = options.anchor.map_or(
-                    CGRect {
-                        origin: CGPoint {
-                            x: bounds.size.width / 2.0,
-                            y: bounds.size.height / 2.0,
-                        },
-                        size: CGSize {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                    },
-                    |anchor| CGRect {
-                        origin: CGPoint {
-                            x: anchor.x,
-                            y: bounds.size.height - anchor.y - anchor.height,
-                        },
-                        size: CGSize {
-                            width: anchor.width,
-                            height: anchor.height,
-                        },
-                    },
-                );
-                unsafe {
-                    picker.showRelativeToRect_ofView_preferredEdge(
-                        rect,
-                        &ns_view,
-                        objc2_foundation::NSRectEdge::NSMinYEdge,
-                    );
-                }
-            });
-            Ok(())
-        })();
+    window.run_on_main_thread(move || {
+        let result = show_share_picker(&window_clone, &options, &temp_paths, completion_tx);
         let _ = setup_tx.send(result);
-    }) {
-        return Err(e.into());
-    }
+    })?;
 
-    let share_result = setup_rx.recv()?;
-    if let Err(err) = share_result {
-        return Err(err);
-    }
+    setup_rx.recv()??;
 
     match completion_rx.recv_timeout(SHARE_COMPLETION_TIMEOUT) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
         Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
     }
+}
+
+/// Builds the shared items and shows the picker. Must run on the main thread.
+fn show_share_picker<R: Runtime>(
+    window: &Window<R>,
+    options: &ShareOptions,
+    temp_paths: &[PathBuf],
+    completion_tx: mpsc::Sender<Result<(), Error>>,
+) -> Result<(), Error> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        Error::NativeApi("The share picker must be shown on the main thread.".to_string())
+    })?;
+    let ns_view = get_ns_view(window)?;
+    let mut items_to_share: Vec<Retained<NSObject>> = Vec::new();
+
+    if let Some(url) = options.url.as_deref() {
+        if let Some(url_obj) = NSURL::URLWithString(&NSString::from_str(url)) {
+            items_to_share.push(unsafe { Retained::cast_unchecked(url_obj) });
+        }
+    }
+
+    if let Some(text) = options.text.as_deref() {
+        items_to_share.push(unsafe { Retained::cast_unchecked(NSString::from_str(text)) });
+    }
+
+    // Temporary files written from Base64 data, then local files shared
+    // directly from their original paths.
+    let file_paths = options.file_paths.iter().flatten().map(PathBuf::from);
+    for path in temp_paths.iter().cloned().chain(file_paths) {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        items_to_share.push(unsafe { Retained::cast_unchecked(url) });
+    }
+
+    if items_to_share.is_empty() {
+        return Err(Error::InvalidArgs(
+            "No content provided to share.".to_string(),
+        ));
+    }
+
+    let subject = options.title.as_deref().map(NSString::from_str);
+
+    autoreleasepool(|_pool| {
+        let objects_refs: Vec<&AnyObject> = items_to_share
+            .iter()
+            .map(|obj| obj.as_ref() as &AnyObject)
+            .collect();
+        let items_array = NSArray::from_slice(&objects_refs);
+        let picker = unsafe {
+            NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items_array)
+        };
+
+        let delegate = SharePickerDelegate::new(mtm, completion_tx, subject);
+        ACTIVE_DELEGATES.with(|delegates| delegates.borrow_mut().push(delegate.retain()));
+        picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+        let bounds = ns_view.bounds();
+        // Web-viewport coordinates are top-left origin; AppKit bounds use a bottom-left origin.
+        // Flip the y-axis so the anchor rect describes the same visual area in NSView space.
+        let rect = options.anchor.map_or(
+            CGRect {
+                origin: CGPoint {
+                    x: bounds.size.width / 2.0,
+                    y: bounds.size.height / 2.0,
+                },
+                size: CGSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            },
+            |anchor| CGRect {
+                origin: CGPoint {
+                    x: anchor.x,
+                    y: bounds.size.height - anchor.y - anchor.height,
+                },
+                size: CGSize {
+                    width: anchor.width,
+                    height: anchor.height,
+                },
+            },
+        );
+        picker.showRelativeToRect_ofView_preferredEdge(
+            rect,
+            &ns_view,
+            objc2_foundation::NSRectEdge::NSMinYEdge,
+        );
+    });
+    Ok(())
 }
 
 /// Retrieves the native `NSView` pointer from the Tauri window, compatible with `raw-window-handle`.
@@ -305,35 +264,4 @@ fn get_ns_view<R: Runtime>(window: &Window<R>) -> Result<Retained<NSView>, Error
             "Unsupported window handle type on macOS.".to_string(),
         ))
     }
-}
-
-/// Creates a secure temporary file from Base64 data.
-fn create_temp_file_for_data(options: &SharedFile) -> Result<NamedTempFile, Error> {
-    let decoded_bytes = general_purpose::STANDARD
-        .decode(&options.data)
-        .map_err(|_| Error::InvalidArgs("Invalid Base64 data.".to_string()))?;
-    if decoded_bytes.len() > MAX_FILE_BYTES {
-        return Err(Error::InvalidArgs(format!(
-            "File '{}' exceeds the maximum size of {} bytes.",
-            options.name, MAX_FILE_BYTES
-        )));
-    }
-    // Security: Sanitize the filename to prevent path traversal attacks.
-    let sanitized_name = Path::new(&options.name)
-        .file_name()
-        .ok_or_else(|| Error::InvalidArgs("Invalid file name.".to_string()))?
-        .to_str()
-        .ok_or_else(|| {
-            Error::InvalidArgs("File name contains invalid UTF-8 characters.".to_string())
-        })?;
-    let temp_dir = std::env::temp_dir();
-    let mut temp_file = Builder::new()
-        .prefix(&format!("{}-", uuid::Uuid::new_v4()))
-        .suffix(&format!("-{}", sanitized_name))
-        .tempfile_in(temp_dir)
-        .map_err(|e| Error::TempFile(format!("Failed to create temp file: {}", e)))?;
-    temp_file
-        .write_all(&decoded_bytes)
-        .map_err(|e| Error::TempFile(format!("Failed to write to temp file: {}", e)))?;
-    Ok(temp_file)
 }

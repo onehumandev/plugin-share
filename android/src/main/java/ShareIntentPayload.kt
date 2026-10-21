@@ -10,9 +10,11 @@ internal data class ShareIntentPayload(
             val title = options.title.nonEmptyOrNull()
             val url = options.url.nonEmptyOrNull()
 
+            val body = if (text != null && url != null) "$text\n$url" else text ?: url
+
             return ShareIntentPayload(
-                title = title ?: text,
-                body = url ?: text,
+                title = title,
+                body = body,
             )
         }
 

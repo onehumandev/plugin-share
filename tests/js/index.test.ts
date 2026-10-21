@@ -122,7 +122,7 @@ describe('share guest API', () => {
 		const file = new File(['hello'], 'a'.repeat(256), { type: 'text/plain' })
 
 		await expect(share({ files: [file] })).rejects.toThrow(
-			'File name exceeds the maximum length of 255 bytes.'
+			'file name exceeds the maximum length of 255 bytes.'
 		)
 
 		expect(tauriCoreMock.invoke).not.toHaveBeenCalled()

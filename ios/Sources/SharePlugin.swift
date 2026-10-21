@@ -4,7 +4,7 @@ import ShareCore
 import UIKit
 import WebKit
 
-@_cdecl("init_plugin_share") 
+@_cdecl("init_plugin_share")
 public func initPlugin() -> Plugin {
     return SharePlugin()
 }
@@ -12,6 +12,11 @@ public func initPlugin() -> Plugin {
 public class SharePlugin: Plugin {
 
     private var webview: WKWebView?
+
+    // Tauri invokes plugin commands on a background IPC queue, while the share sheet
+    // completion runs on the main thread. All access to the share state below must go
+    // through `stateLock`.
+    private let stateLock = NSLock()
     private var temporaryFileURLs: [URL] = []
     private var shareInProgress = false
 
@@ -29,94 +34,100 @@ public class SharePlugin: Plugin {
      * This is a manual cleanup utility for the developer.
      */
     @objc func cleanup(_ invoke: Invoke) {
+        stateLock.lock()
         if shareInProgress {
+            stateLock.unlock()
             invoke.reject("Cannot cleanup while sharing is in progress.")
             return
         }
 
-        do {
+        // Holding the lock prevents a share from starting while the directory is removed.
+        let result = Result<Void, Error> {
             let shareDir = try getSafeShareDir()
             if FileManager.default.fileExists(atPath: shareDir.path) {
                 try FileManager.default.removeItem(at: shareDir)
             }
             temporaryFileURLs.removeAll()
+        }
+        stateLock.unlock()
+
+        switch result {
+        case .success:
             invoke.resolve()
-        } catch {
+        case .failure(let error):
             invoke.reject("Error during cleanup: \(error.localizedDescription)")
         }
     }
 
     @objc func share(_ invoke: Invoke) throws {
-        if shareInProgress {
-            invoke.reject("Share already in progress.")
-            return
-        }
-
         let args = try invoke.parseArgs(ShareOptions.self)
         if let validationError = validateShareOptions(args) {
             invoke.reject(validationError)
             return
         }
 
+        // Share local files directly from their original paths. This preserves the
+        // original filename and avoids creating temporary copies.
+        let filePaths = args.filePaths ?? []
+        for path in filePaths where !isExistingRegularFile(atPath: path) {
+            invoke.reject("File not found: \(path)")
+            return
+        }
+
+        guard beginShare() else {
+            invoke.reject("Share already in progress.")
+            return
+        }
+
+        // Empty strings are treated as absent.
+        let subject = nonEmpty(args.title)
         var activityItems: [Any] = []
         var createdFileURLs: [URL] = []
-        shareInProgress = true
 
-        if let urlString = args.url, !urlString.isEmpty, let url = URL(string: urlString) {
+        if let urlString = nonEmpty(args.url), let url = URL(string: urlString) {
             activityItems.append(url)
         }
-        if let text = args.text {
+        if let text = nonEmpty(args.text) {
             activityItems.append(text)
         }
 
+        // Decoding and writing happen on the IPC queue, off the main thread.
         if let files = args.files {
             for file in files {
-                guard let decodedData = Data(base64Encoded: file.data) else {
-                    cleanupTemporaryFiles(createdFileURLs)
-                    _ = resetShareState()
-                    invoke.reject("Invalid Base64 data for file: \(file.name)")
+                guard let decodedData = decodeBase64(file.data) else {
+                    fail(invoke, "Invalid Base64 data for file: \(file.name)", files: createdFileURLs)
                     return
                 }
                 if decodedData.count > maxFileBytes {
-                    cleanupTemporaryFiles(createdFileURLs)
-                    _ = resetShareState()
-                    invoke.reject("File '\(file.name)' exceeds the maximum size of \(maxFileBytes) bytes.")
+                    fail(invoke, "File '\(file.name)' exceeds the maximum size of \(maxFileBytes) bytes.", files: createdFileURLs)
                     return
                 }
 
                 do {
                     let tempFileURL = try createSafeTempFile(for: file.name)
+                    createdFileURLs.append(tempFileURL)
                     try decodedData.write(to: tempFileURL, options:.atomic)
                     activityItems.append(tempFileURL)
-                    createdFileURLs.append(tempFileURL)
                 } catch {
-                    cleanupTemporaryFiles(createdFileURLs)
-                    _ = resetShareState()
-                    invoke.reject("Failed to create temporary file: \(error.localizedDescription)")
+                    fail(invoke, "Failed to create temporary file: \(error.localizedDescription)", files: createdFileURLs)
                     return
                 }
             }
         }
 
-        // Share local files directly from their original paths. This preserves the
-        // original filename and avoids creating temporary copies.
-        if let filePaths = args.filePaths {
-            for path in filePaths {
-                let fileURL = URL(fileURLWithPath: path)
-                activityItems.append(fileURL)
-            }
+        for path in filePaths {
+            activityItems.append(URL(fileURLWithPath: path))
         }
 
         if activityItems.isEmpty {
-            _ = resetShareState()
-            invoke.reject("No content provided to share.")
+            fail(invoke, "No content provided to share.")
             return
         }
 
-        temporaryFileURLs.append(contentsOf: createdFileURLs)
-        presentShareSheet(invoke: invoke, activityItems: activityItems, anchor: args.anchor)
+        registerTemporaryFiles(createdFileURLs)
+        presentShareSheet(invoke: invoke, activityItems: activityItems, subject: subject, anchor: args.anchor)
     }
-    
+
     /**
      * Returns the URL for a dedicated, secure directory for storing temporary share files.
      * Creates it if it doesn't exist.
@@ -124,62 +135,67 @@ public class SharePlugin: Plugin {
     private func getSafeShareDir() throws -> URL {
         let tempDir = FileManager.default.temporaryDirectory
         let shareDir = tempDir.appendingPathComponent("share")
-        
+
         if !FileManager.default.fileExists(atPath: shareDir.path) {
             try FileManager.default.createDirectory(
                 at: shareDir,
                 withIntermediateDirectories: true
             )
         }
-        
+
         return shareDir
     }
 
     /**
      * Creates a safe temporary file URL within the dedicated share directory.
-     * It sanitizes the filename and prepends a UUID to guarantee uniqueness.
+     * It keeps only the last path component of the name and places the file in its own UUID directory.
      */
     private func createSafeTempFile(for untrustedFileName: String) throws -> URL {
         let safeDir = try getSafeShareDir()
-        
+
         let sanitizedBaseName = URL(fileURLWithPath: untrustedFileName).lastPathComponent
-        if sanitizedBaseName.isEmpty {
+        if sanitizedBaseName.isEmpty || sanitizedBaseName == "." || sanitizedBaseName == ".." || sanitizedBaseName == "/" {
             throw NSError(domain: "SharePlugin", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid filename: sanitized name is empty."])
         }
-        
-        let finalFileName = "\(UUID().uuidString)-\(sanitizedBaseName)"
-        
-        return safeDir.appendingPathComponent(finalFileName)
+
+        // Each file gets its own directory so the original filename is preserved
+        // without colliding with other shared files.
+        let fileDir = safeDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: fileDir, withIntermediateDirectories: false)
+
+        return fileDir.appendingPathComponent(sanitizedBaseName)
     }
 
-    private func presentShareSheet(invoke: Invoke, activityItems: [Any], anchor: ShareAnchor? = nil) {
+    private func presentShareSheet(invoke: Invoke, activityItems: [Any], subject: String?, anchor: ShareAnchor? = nil) {
         DispatchQueue.main.async {
             guard let viewController = self.manager.viewController else {
-                _ = self.resetShareState()
-                invoke.reject("Could not find root view controller.")
+                self.fail(invoke, "Could not find root view controller.")
                 return
             }
 
             guard viewController.presentedViewController == nil else {
-                let filesToClean = self.resetShareState()
-                self.cleanupTemporaryFiles(filesToClean)
-                invoke.reject("Another view controller is already being presented.")
+                self.fail(invoke, "Another view controller is already being presented.")
                 return
             }
 
-            let activityViewController = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+            var items = activityItems
+            // Provide the title as the subject (e.g. for Mail) via the leading text/url item.
+            if let subject = subject, let first = items.first, first is URL || first is String,
+               !((first as? URL)?.isFileURL ?? false) {
+                items[0] = ShareSubjectItemSource(item: first, subject: subject)
+            }
+
+            let activityViewController = UIActivityViewController(activityItems: items, applicationActivities: nil)
             if UIDevice.current.userInterfaceIdiom == .pad {
                 activityViewController.modalPresentationStyle = .popover
             }
-            
+
             activityViewController.completionWithItemsHandler = { _, _, _, error in
                 DispatchQueue.main.async {
-                    let filesToClean = self.resetShareState()
-                    self.cleanupTemporaryFiles(filesToClean)
-
                     if let anError = error {
-                        invoke.reject("Sharing failed: \(anError.localizedDescription)")
+                        self.fail(invoke, "Sharing failed: \(anError.localizedDescription)")
                     } else {
+                        self.cleanupTemporaryFiles(self.resetShareState())
                         invoke.resolve()
                     }
                 }
@@ -188,9 +204,7 @@ public class SharePlugin: Plugin {
             // iPad presentation logic
             if let popoverController = activityViewController.popoverPresentationController {
                 guard let sourceView = self.webview ?? viewController.view else {
-                    let filesToClean = self.resetShareState()
-                    self.cleanupTemporaryFiles(filesToClean)
-                    invoke.reject("Could not find a source view for the share popover.")
+                    self.fail(invoke, "Could not find a source view for the share popover.")
                     return
                 }
                 popoverController.sourceView = sourceView
@@ -213,7 +227,35 @@ public class SharePlugin: Plugin {
         }
     }
 
+    /**
+     * Ends the current share with an error: deletes the given files and every
+     * registered temporary file, resets the share state and rejects the invoke.
+     */
+    private func fail(_ invoke: Invoke, _ message: String, files: [URL] = []) {
+        cleanupTemporaryFiles(files + resetShareState())
+        invoke.reject(message)
+    }
+
+    /// Atomically marks a share as started. Returns false if one is already in progress.
+    private func beginShare() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if shareInProgress {
+            return false
+        }
+        shareInProgress = true
+        return true
+    }
+
+    private func registerTemporaryFiles(_ urls: [URL]) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        temporaryFileURLs.append(contentsOf: urls)
+    }
+
     private func resetShareState() -> [URL] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let filesToClean = temporaryFileURLs
         temporaryFileURLs.removeAll()
         shareInProgress = false
@@ -221,11 +263,42 @@ public class SharePlugin: Plugin {
     }
 
     private func cleanupTemporaryFiles(_ urls: [URL]) {
+        if urls.isEmpty {
+            return
+        }
         DispatchQueue.global(qos:.utility).async {
             for url in urls {
                 try? FileManager.default.removeItem(at: url)
+                // Also remove the per-file directory created by createSafeTempFile.
+                try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             }
         }
+    }
+}
+
+/**
+ * Wraps the leading text or URL item so the share title is offered as the subject
+ * (e.g. the email subject line) while the shared item itself is unchanged.
+ */
+private final class ShareSubjectItemSource: NSObject, UIActivityItemSource {
+    private let item: Any
+    private let subject: String
+
+    init(item: Any, subject: String) {
+        self.item = item
+        self.subject = subject
+    }
+
+    func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any {
+        return item
+    }
+
+    func activityViewController(_ activityViewController: UIActivityViewController, itemForActivityType activityType: UIActivity.ActivityType?) -> Any? {
+        return item
+    }
+
+    func activityViewController(_ activityViewController: UIActivityViewController, subjectForActivityType activityType: UIActivity.ActivityType?) -> String {
+        return subject
     }
 }
 #endif

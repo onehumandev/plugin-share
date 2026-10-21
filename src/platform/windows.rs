@@ -1,33 +1,37 @@
 use super::focus;
+use super::temp_files::stage_files;
 use crate::state::PluginTempFileManager;
-use crate::{CanShareResult, Error, ShareOptions, SharedFile, MAX_FILE_BYTES};
-use base64::{engine::general_purpose, Engine as _};
+use crate::{CanShareResult, Error, ShareOptions};
 use log::error;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use tauri::{Runtime, State, Window};
-use windows::core::{Interface, HSTRING};
+use std::sync::atomic::{AtomicI64, AtomicIsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
+use tauri::{Runtime, Window};
+use windows::core::{AgileReference, Interface, HSTRING};
 use windows::ApplicationModel::DataTransfer::{
-    DataPackageOperation, DataRequestDeferral, DataRequestedEventArgs, DataTransferManager,
+    DataPackageOperation, DataRequestedEventArgs, DataTransferManager,
 };
 use windows::Foundation::{TypedEventHandler, Uri};
 use windows::Storage::{IStorageItem, StorageFile};
 use windows::Win32::{
     Foundation::HWND,
-    System::WinRT::{RoInitialize, RO_INIT_SINGLETHREADED},
+    System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED},
     UI::Shell::IDataTransferManagerInterop,
 };
 use windows_collections::IIterable;
 
-// This thread-local holds the DataTransferManager and its event registration token, keeping them
-// alive for the duration of the asynchronous share operation. It's only accessible
-// on the main thread, which is safe for these non-thread-safe WinRT types.
+const DATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Holds each window's DataTransferManager and its DataRequested registration token,
+// keyed by HWND, for the duration of the share. It is only touched on the main
+// thread, which is where these WinRT objects live.
 thread_local! {
-    static SHARE_STATE: RefCell<Option<(DataTransferManager, i64)>> = RefCell::new(None);
+    static SHARE_REGISTRATIONS: RefCell<HashMap<isize, (DataTransferManager, i64)>> =
+        RefCell::new(HashMap::new());
 }
 
 // A helper to map the detailed windows::core::Error into our plugin's simpler error type.
@@ -37,30 +41,14 @@ impl From<windows::core::Error> for Error {
     }
 }
 
-/// Ensures a `DataRequestDeferral` is always completed when the handler scope ends.
-struct DeferralGuard(Option<DataRequestDeferral>);
-
-impl DeferralGuard {
-    fn new(deferral: DataRequestDeferral) -> Self {
-        Self(Some(deferral))
-    }
-}
-
-impl Drop for DeferralGuard {
-    fn drop(&mut self) {
-        if let Some(deferral) = self.0.take() {
-            let _ = deferral.Complete();
-        }
-    }
-}
-
-pub fn cleanup() -> Result<(), Error> {
-    let temp_dir = get_plugin_temp_dir()?;
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(temp_dir)
-            .map_err(|e| Error::TempFile(format!("Failed to cleanup temp dir: {}", e)))?;
-    }
-    Ok(())
+/// Everything the DataRequested handler puts into the data package. Files are
+/// resolved to storage items before the share UI is shown; agile references let
+/// them move from the calling thread to the UI thread.
+struct ShareContent {
+    title: String,
+    text: Option<String>,
+    url: Option<String>,
+    storage_items: Vec<AgileReference<IStorageItem>>,
 }
 
 pub fn can_share() -> Result<CanShareResult, Error> {
@@ -70,180 +58,17 @@ pub fn can_share() -> Result<CanShareResult, Error> {
 pub fn share<R: Runtime>(
     window: Window<R>,
     options: ShareOptions,
-    state: State<'_, PluginTempFileManager>,
+    state: &PluginTempFileManager,
 ) -> Result<(), Error> {
+    let content = prepare_content(&options, state)?;
     let focus_wait = focus::begin_focus_wait(&window)?;
     let (tx, rx) = mpsc::channel();
-    let win_clone = window.clone();
+    let registered_hwnd = Arc::new(AtomicIsize::new(0));
 
-    let managed_files_arc = state.inner().managed_files.clone();
-    let tx_handler = tx.clone();
-
-    let options = options;
-
+    let main_window = window.clone();
+    let main_registered_hwnd = registered_hwnd.clone();
     if let Err(e) = window.run_on_main_thread(move || {
-        let tx_for_handler = tx_handler;
-        let result = (|| -> Result<(), Error> {
-            initialize_winrt_thread()?;
-            let hwnd = get_hwnd(&win_clone)?;
-            let (dtm, interop) = get_data_transfer_manager(hwnd)?;
-
-            let data_requested_handler = TypedEventHandler::new({
-                let options_clone = std::sync::Arc::new(options.clone());
-                let managed_files_arc_clone_for_handler = managed_files_arc.clone();
-                move |_, args: windows::core::Ref<'_, DataRequestedEventArgs>| -> windows::core::Result<()> {
-                    let handler_result = (|| -> Result<(), Error> {
-                        let request_args = (*args).as_ref().ok_or_else(|| Error::NativeApi("Missing DataRequestedEventArgs".to_string()))?;
-                        let request = request_args.Request()?;
-                        let data = request.Data()?;
-                        let properties = data.Properties()?;
-
-                        let title = options_clone.title.clone().unwrap_or_else(|| {
-                            options_clone
-                                .file_paths
-                                .as_ref()
-                                .and_then(|paths| paths.first())
-                                .and_then(|path| Path::new(path).file_name())
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .or_else(|| {
-                                    options_clone
-                                        .files
-                                        .as_ref()
-                                        .and_then(|files| files.first())
-                                        .map(|file| file.name.clone())
-                                })
-                                .unwrap_or_else(|| "Shared content".to_string())
-                        });
-
-                        properties.SetTitle(&HSTRING::from(&title))?;
-
-                        if let (Some(t), Some(u)) = (&options_clone.text, &options_clone.url) {
-                            // Set the plain text content.
-                            data.SetText(&HSTRING::from(t))?;
-
-                            // Attempt to parse the URL string into a Windows Uri object.
-                            // It is crucial to validate the URL string to ensure it forms a valid Uri.
-                            if let Ok(uri) = Uri::CreateUri(&HSTRING::from(u)) {
-                                // For web URLs (HTTP/HTTPS), SetWebLink is the preferred method.
-                                // For application-specific URIs, SetApplicationLink would be used.
-                                // Here, we assume it's a web URL for demonstration.
-                                data.SetWebLink(&uri)?;
-                            } else {
-                                // If the URL string cannot be parsed into a valid Uri object,
-                                // a warning is logged. In such cases, the URL might still be
-                                // valuable as part of the plain text.
-                                error!("Warning: Could not parse URL '{}' for DataPackage::SetWebLink. Setting as part of text.", u);
-                                // Optionally, if it's critical for the URL to be present in some form,
-                                // even if not semantically, it could be appended to the plain text.
-                                let combined_text_fallback = format!("{}\n{}", t, u);
-                                data.SetText(&HSTRING::from(combined_text_fallback))?;
-                                // However, the primary goal remains semantic separation.
-                            }
-                        }
-                        // If only text is provided, simply set the plain text content.
-                        else if let Some(t) = &options_clone.text {
-                            if !t.is_empty() {
-                                data.SetText(&HSTRING::from(t))?;
-                            }
-                        }
-                        // If only a URL is provided, attempt to set it semantically.
-                        else if let Some(u) = &options_clone.url {
-                            if let Ok(uri) = Uri::CreateUri(&HSTRING::from(u)) {
-                                data.SetWebLink(&uri)?;
-                            } else {
-                                // If URL parsing fails, fall back to setting it as plain text.
-                                // This ensures the URL string is still transferred, even without its semantic type.
-                                error!("Warning: Could not parse URL '{}' for DataPackage::SetWebLink. Setting as plain text.", u);
-                                data.SetText(&HSTRING::from(u))?;
-                            }
-                        }
-
-                        if options_clone.files.is_some() || options_clone.file_paths.is_some() {
-                            let deferral = request.GetDeferral()?;
-                            let _guard = DeferralGuard::new(deferral);
-                            let mut storage_items: Vec<Option<IStorageItem>> = Vec::new();
-
-                            if let Some(files) = &options_clone.files {
-                                let temp_dir = get_plugin_temp_dir()?;
-                                for file in files {
-                                    let path_buf = create_temp_file_for_data(file, &temp_dir)?;
-                                    let path_str = path_buf.to_string_lossy().to_string();
-                                    let mut files = managed_files_arc_clone_for_handler
-                                        .lock()
-                                        .map_err(|e| Error::NativeApi(format!("Failed to lock temp file manager: {}", e)))?;
-                                    files.push(path_buf);
-
-                                    let storage_file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path_str))
-                                        .map_err(|e| Error::NativeApi(format!("GetFileFromPathAsync failed for temp file: {}", e)))?
-                                        .get()
-                                        .map_err(|e| Error::NativeApi(format!("GetFileFromPathAsync result failed for temp file: {}", e)))?;
-                                    let item: IStorageItem = storage_file.cast()
-                                        .map_err(|e| Error::NativeApi(format!("Failed to cast temp StorageFile to IStorageItem: {}", e)))?;
-                                    storage_items.push(Some(item));
-                                }
-                            }
-
-                            if let Some(file_paths) = &options_clone.file_paths {
-                                for path in file_paths {
-                                    if path.is_empty() {
-                                        continue;
-                                    }
-
-                                    // Normalize any forward slashes to Windows backslashes. The
-                                    // frontend may pass absolute paths with either separator, but
-                                    // WinRT's StorageFile API is stricter about backslash separators.
-                                    let normalized_path = path.replace('/', "\\");
-
-                                    let storage_file = StorageFile::GetFileFromPathAsync(&HSTRING::from(normalized_path))
-                                        .map_err(|e| Error::NativeApi(format!("GetFileFromPathAsync failed for '{}': {}", path, e)))?
-                                        .get()
-                                        .map_err(|e| Error::NativeApi(format!("GetFileFromPathAsync result failed for '{}': {}", path, e)))?;
-                                    let item: IStorageItem = storage_file.cast()
-                                        .map_err(|e| Error::NativeApi(format!("Failed to cast StorageFile to IStorageItem for '{}': {}", path, e)))?;
-                                    storage_items.push(Some(item));
-                                }
-                            }
-
-                            if !storage_items.is_empty() {
-                                let iterable_items: IIterable<IStorageItem> = storage_items.try_into()
-                                    .map_err(|e| Error::NativeApi(format!("Failed to convert storage items to IIterable: {}", e)))?;
-
-                                data.SetRequestedOperation(DataPackageOperation::Copy)
-                                    .map_err(|e| Error::NativeApi(format!("Failed to set requested operation: {}", e)))?;
-                                data.SetStorageItems(&iterable_items, true)
-                                    .map_err(|e| Error::NativeApi(format!("Failed to set storage items on DataPackage: {}", e)))?;
-                            }
-                        }
-
-                        Ok(())
-                    })();
-
-                    if let Err(e) = &handler_result {
-                        error!("[share] DataRequested handler failed: {}", e);
-                    }
-                    let _ = tx_for_handler.send(handler_result);
-
-                    SHARE_STATE.with(|state| {
-                        if let Some((manager, token)) = state.borrow_mut().take() {
-                            let _ = manager.RemoveDataRequested(token);
-                        }
-                    });
-
-                    Ok(())
-                }
-            });
-
-            let token = dtm.DataRequested(&data_requested_handler)?;
-
-            SHARE_STATE.with(|state| {
-                *state.borrow_mut() = Some((dtm, token));
-            });
-
-            unsafe { interop.ShowShareUIForWindow(hwnd) }?;
-            Ok(())
-        })();
-
-        if let Err(err) = result {
+        if let Err(err) = show_share_ui(&main_window, content, tx.clone(), &main_registered_hwnd) {
             let _ = tx.send(Err(err));
         }
     }) {
@@ -251,31 +76,240 @@ pub fn share<R: Runtime>(
         return Err(e.into());
     }
 
-    let share_result = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(result) => result,
+    match rx.recv_timeout(DATA_REQUEST_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            focus_wait.cancel();
+            return Err(err);
+        }
         Err(err) => {
             focus_wait.cancel();
+            let hwnd_key = registered_hwnd.load(Ordering::SeqCst);
+            if hwnd_key != 0 {
+                let _ = window.run_on_main_thread(move || unregister(hwnd_key, None));
+            }
             return Err(Error::NativeApi(format!(
                 "Share timed out waiting for DataRequested event: {}",
                 err
             )));
         }
-    };
-    if let Err(err) = share_result {
-        focus_wait.cancel();
-        return Err(err);
     }
 
-    focus_wait.wait()?;
+    // The data has been handed to the share UI; now wait for the window to lose
+    // and regain focus, which is how desktop apps observe the dialog closing.
+    focus_wait.start_grace_timer();
+    focus_wait.wait()
+}
+
+/// Writes Base64 files to disk and resolves every file to a WinRT storage item.
+/// Runs on the calling thread so missing files fail before any UI is shown and
+/// the UI thread never blocks on file system calls.
+fn prepare_content(
+    options: &ShareOptions,
+    state: &PluginTempFileManager,
+) -> Result<ShareContent, Error> {
+    let temp_paths = stage_files(options.files.as_deref(), state)?;
+    // WinRT's StorageFile API is stricter about separators than the frontend, so
+    // normalize forward slashes in caller-provided paths.
+    let file_paths = options
+        .file_paths
+        .iter()
+        .flatten()
+        .map(|path| PathBuf::from(path.replace('/', "\\")));
+
+    let storage_items = temp_paths
+        .into_iter()
+        .chain(file_paths)
+        .map(|path| storage_item_for_path(&path))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ShareContent {
+        title: share_title(options),
+        text: options.text.clone(),
+        url: options.url.clone(),
+        storage_items,
+    })
+}
+
+/// Windows requires a non-empty title. Use the caller's title, else the first
+/// file name, else a generic label.
+fn share_title(options: &ShareOptions) -> String {
+    let first_path_name = options
+        .file_paths
+        .iter()
+        .flatten()
+        .next()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let first_file_name = options
+        .files
+        .iter()
+        .flatten()
+        .next()
+        .map(|file| file.name.clone());
+    options
+        .title
+        .clone()
+        .or(first_path_name)
+        .or(first_file_name)
+        .unwrap_or_else(|| "Shared content".to_string())
+}
+
+fn storage_item_for_path(path: &Path) -> Result<AgileReference<IStorageItem>, Error> {
+    let display = path.display();
+    let storage_file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))
+        .and_then(|operation| operation.get())
+        .map_err(|e| {
+            Error::NativeApi(format!("Failed to open '{}' for sharing: {}", display, e))
+        })?;
+    storage_file
+        .cast::<IStorageItem>()
+        .and_then(|item| AgileReference::new(&item))
+        .map_err(|e| {
+            Error::NativeApi(format!(
+                "Failed to prepare '{}' for sharing: {}",
+                display, e
+            ))
+        })
+}
+
+/// Registers the DataRequested handler for the window and shows the share UI.
+/// Must run on the main thread.
+fn show_share_ui<R: Runtime>(
+    window: &Window<R>,
+    content: ShareContent,
+    tx: mpsc::Sender<Result<(), Error>>,
+    registered_hwnd: &AtomicIsize,
+) -> Result<(), Error> {
+    let _winrt = WinRtGuard::initialize()?;
+    let hwnd = get_hwnd(window)?;
+    let hwnd_key = hwnd.0 as isize;
+    let (dtm, interop) = get_data_transfer_manager(hwnd)?;
+
+    // A previous share on this window that never received DataRequested would
+    // otherwise keep its handler and add its data to this share.
+    unregister(hwnd_key, None);
+
+    let token_cell = Arc::new(AtomicI64::new(0));
+    let handler_token = token_cell.clone();
+    let handler = TypedEventHandler::new(
+        move |_,
+              args: windows::core::Ref<'_, DataRequestedEventArgs>|
+              -> windows::core::Result<()> {
+            let result = (*args)
+                .as_ref()
+                .ok_or_else(|| Error::NativeApi("Missing DataRequestedEventArgs".to_string()))
+                .and_then(|args| fill_data_package(args, &content));
+            if let Err(e) = &result {
+                error!("[share] DataRequested handler failed: {}", e);
+            }
+            let _ = tx.send(result);
+            unregister(hwnd_key, Some(handler_token.load(Ordering::SeqCst)));
+            Ok(())
+        },
+    );
+
+    let token = dtm.DataRequested(&handler)?;
+    token_cell.store(token, Ordering::SeqCst);
+    SHARE_REGISTRATIONS.with(|registrations| {
+        registrations.borrow_mut().insert(hwnd_key, (dtm, token));
+    });
+    registered_hwnd.store(hwnd_key, Ordering::SeqCst);
+
+    if let Err(e) = unsafe { interop.ShowShareUIForWindow(hwnd) } {
+        unregister(hwnd_key, Some(token));
+        return Err(e.into());
+    }
     Ok(())
 }
 
-/// Initializes the Windows Runtime on the current thread.
-fn initialize_winrt_thread() -> Result<(), Error> {
-    // RoInitialize can be called multiple times on the same thread.
-    // It will return S_FALSE if already initialized, which is not an error.
-    unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
-        .map_err(|e| Error::NativeApi(format!("Failed to initialize WinRT: {}", e)))
+/// Puts the prepared content into the share request's data package.
+fn fill_data_package(args: &DataRequestedEventArgs, content: &ShareContent) -> Result<(), Error> {
+    let data = args.Request()?.Data()?;
+    data.Properties()?
+        .SetTitle(&HSTRING::from(&content.title))?;
+
+    let web_link =
+        content
+            .url
+            .as_deref()
+            .and_then(|url| match Uri::CreateUri(&HSTRING::from(url)) {
+                Ok(uri) => Some(uri),
+                Err(_) => {
+                    error!(
+                        "Could not parse URL '{}' for DataPackage::SetWebLink; sharing it as text.",
+                        url
+                    );
+                    None
+                }
+            });
+
+    // Targets that only read text should still see the URL, so it is appended to
+    // the text unless it could be set as a proper web link.
+    let text = match (&content.text, &content.url, &web_link) {
+        (Some(text), _, Some(_)) => Some(text.clone()),
+        (Some(text), Some(url), None) => Some(format!("{text}\n{url}")),
+        (Some(text), None, None) => Some(text.clone()),
+        (None, Some(url), None) => Some(url.clone()),
+        (None, _, _) => None,
+    };
+    if let Some(text) = text {
+        data.SetText(&HSTRING::from(text))?;
+    }
+    if let Some(uri) = web_link {
+        data.SetWebLink(&uri)?;
+    }
+
+    if !content.storage_items.is_empty() {
+        let items = content
+            .storage_items
+            .iter()
+            .map(|item| item.resolve().map(Some))
+            .collect::<windows::core::Result<Vec<Option<IStorageItem>>>>()?;
+        let iterable_items: IIterable<IStorageItem> = items.into();
+        data.SetRequestedOperation(DataPackageOperation::Copy)
+            .map_err(|e| Error::NativeApi(format!("Failed to set requested operation: {}", e)))?;
+        data.SetStorageItems(&iterable_items, true).map_err(|e| {
+            Error::NativeApi(format!("Failed to set storage items on DataPackage: {}", e))
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Removes the window's DataRequested registration. With `Some(token)`, only that
+/// registration is removed, so a finished share never removes a newer one.
+fn unregister(hwnd_key: isize, token: Option<i64>) {
+    SHARE_REGISTRATIONS.with(|registrations| {
+        let mut registrations = registrations.borrow_mut();
+        let matches = registrations
+            .get(&hwnd_key)
+            .is_some_and(|(_, registered)| token.is_none_or(|token| token == *registered));
+        if matches {
+            if let Some((manager, registered)) = registrations.remove(&hwnd_key) {
+                let _ = manager.RemoveDataRequested(registered);
+            }
+        }
+    });
+}
+
+/// Initializes the Windows Runtime on the current thread for the guard's lifetime.
+/// Each successful `RoInitialize` (including `S_FALSE` when it was already
+/// initialized) is balanced with `RoUninitialize`.
+struct WinRtGuard;
+
+impl WinRtGuard {
+    fn initialize() -> Result<Self, Error> {
+        unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
+            .map_err(|e| Error::NativeApi(format!("Failed to initialize WinRT: {}", e)))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for WinRtGuard {
+    fn drop(&mut self) {
+        unsafe { RoUninitialize() };
+    }
 }
 
 /// Retrieves the native window handle (HWND) from the Tauri window.
@@ -300,113 +334,4 @@ fn get_data_transfer_manager(
     let interop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()?;
     let dtm = unsafe { interop.GetForWindow(hwnd) }?;
     Ok((dtm, interop))
-}
-
-/// Returns the path to a dedicated, secure directory for this plugin's temporary files.
-fn get_plugin_temp_dir() -> Result<PathBuf, Error> {
-    let dir = std::env::temp_dir().join("tauri-plugin-share");
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::TempFile(format!("Failed to create temp dir: {}", e)))?;
-    }
-    Ok(dir)
-}
-
-/// Creates a secure temporary file from Base64 data inside `temp_dir`.
-fn create_temp_file_for_data(file: &SharedFile, temp_dir: &Path) -> Result<PathBuf, Error> {
-    let decoded_bytes = general_purpose::STANDARD
-        .decode(&file.data)
-        .map_err(|_| Error::InvalidArgs("Invalid Base64 data provided".to_string()))?;
-    if decoded_bytes.len() > MAX_FILE_BYTES {
-        return Err(Error::InvalidArgs(format!(
-            "File '{}' exceeds the maximum size of {} bytes.",
-            file.name, MAX_FILE_BYTES
-        )));
-    }
-
-    // Security: Sanitize the filename to prevent path traversal attacks.
-    // We only use the filename part and ignore any directory structure.
-    let sanitized_name = Path::new(&file.name)
-        .file_name()
-        .ok_or_else(|| Error::InvalidArgs("Invalid file name provided".to_string()))?
-        .to_str()
-        .ok_or_else(|| Error::InvalidArgs("File name contains invalid UTF-8".to_string()))?;
-
-    let temp_path = temp_dir.join(format!("{}-{}", uuid::Uuid::new_v4(), sanitized_name));
-
-    let mut file_handle = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|e| Error::TempFile(format!("Failed to create temp file: {}", e)))?;
-
-    file_handle
-        .write_all(&decoded_bytes)
-        .map_err(|e| Error::TempFile(format!("Failed to write to temp file: {}", e)))?;
-
-    Ok(temp_path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn sample_shared_file() -> SharedFile {
-        SharedFile {
-            data: general_purpose::STANDARD.encode(b"hello world"),
-            name: "hello.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-        }
-    }
-
-    #[test]
-    fn create_temp_file_for_data_creates_expected_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let file = sample_shared_file();
-
-        let path = create_temp_file_for_data(&file, temp_dir.path()).unwrap();
-
-        assert_eq!(path.parent().unwrap(), temp_dir.path());
-        let name = path.file_name().unwrap().to_string_lossy();
-        assert!(name.ends_with("-hello.txt"), "unexpected file name: {name}");
-        assert_eq!(fs::read(&path).unwrap(), b"hello world");
-    }
-
-    #[test]
-    fn create_temp_file_for_data_rejects_invalid_base64() {
-        let temp_dir = TempDir::new().unwrap();
-        let file = SharedFile {
-            data: "not-valid-base64!!!".to_string(),
-            name: "bad.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-        };
-
-        let err = create_temp_file_for_data(&file, temp_dir.path()).unwrap_err();
-
-        assert!(
-            matches!(err, Error::InvalidArgs(_)),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn create_temp_file_for_data_sanitizes_path_traversal_in_name() {
-        let temp_dir = TempDir::new().unwrap();
-        let file = SharedFile {
-            data: general_purpose::STANDARD.encode(b"payload"),
-            name: "../etc/secret.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-        };
-
-        let path = create_temp_file_for_data(&file, temp_dir.path()).unwrap();
-
-        assert_eq!(path.parent().unwrap(), temp_dir.path());
-        let name = path.file_name().unwrap().to_string_lossy();
-        assert!(
-            name.ends_with("-secret.txt"),
-            "unexpected file name: {name}"
-        );
-    }
 }

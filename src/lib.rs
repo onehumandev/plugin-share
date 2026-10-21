@@ -2,15 +2,15 @@
 //!
 //! A Tauri plugin to share content using the native sharing dialog on Windows, macOS, and mobile platforms.
 //!
-//! On desktop, the plugin handles sharing text, URLs, and files. For files, it manages their lifecycle by creating
-//! temporary files from Base64 content and cleaning them up once the share dialog is closed or the application exits.
+//! On desktop, the plugin handles sharing text, URLs, and files. Files passed as Base64 content are written to
+//! temporary files that keep their original name, and are removed by the `cleanup` command or when the
+//! application exits. Linux has no native share dialog: `can_share` returns `false` and `share` fails.
 //!
 //! ## Installation
 //!
-//! ```sh
-//! # Cargo.toml
+//! ```toml
 //! [dependencies]
-//! tauri-plugin-vnidrop-share = { git = "[https://github.com/vnidrop/plugin-share](https://github.com/vnidrop/plugin-share)" }
+//! tauri-plugin-vnidrop-share = "1.0.0-rc"
 //! ```
 //!
 //! ## Usage
@@ -31,33 +31,21 @@
 //!
 //! ### Frontend (JavaScript/TypeScript)
 //!
-//! The plugin provides a JavaScript API to call the commands.
-//!
 //! ```js
 //! import { share, canShare } from '@vnidrop/tauri-plugin-share';
 //!
-//! // Check if sharing is available
-//! const canShareResult = await canShare();
-//! console.log(`Can share on this platform: ${canShareResult}`);
-//!
-//! // Share text and a URL
-//! if (canShareResult) {
+//! if (await canShare()) {
 //!   await share({
 //!     title: 'Check this out!',
 //!     text: 'I found this cool project built with Tauri.',
-//!     url: '[https://tauri.app](https://tauri.app)',
+//!     url: 'https://tauri.app',
 //!   });
 //! }
 //!
-//! // Share a file from Base64 content
-//! // The file will be created as a temporary file and cleaned up automatically.
-//! const fileContent = '...'; // Your Base64-encoded file data
-//! const blob = new Blob([fileContent], { type: 'text/plain' });
-//! await share({
-//!   files: [new File([blob], 'document.txt')],
-//! });
+//! // Share a file; it is written to a temporary file and cleaned up later.
+//! const file = new File(['hello'], 'document.txt', { type: 'text/plain' });
+//! await share({ files: [file] });
 //! ```
-//!
 
 use tauri::{
     plugin::{Builder, TauriPlugin},
@@ -74,6 +62,7 @@ mod mobile;
 mod commands;
 mod error;
 mod models;
+#[cfg(desktop)]
 mod platform;
 mod state;
 

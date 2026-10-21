@@ -6,7 +6,7 @@ import org.junit.Test
 
 class ShareIntentPayloadUnitTest {
     @Test
-    fun usesUrlAsBodyAndTextAsFallbackTitle() {
+    fun combinesTextAndUrlIntoBodyWithoutTitleFallback() {
         val payload = ShareIntentPayload.from(
             options(
                 text = "Read this article",
@@ -14,12 +14,12 @@ class ShareIntentPayloadUnitTest {
             )
         )
 
-        assertEquals("Read this article", payload.title)
-        assertEquals("https://example.com/article", payload.body)
+        assertNull(payload.title)
+        assertEquals("Read this article\nhttps://example.com/article", payload.body)
     }
 
     @Test
-    fun explicitTitleTakesPrecedenceOverText() {
+    fun explicitTitleIsUsedAsTitleOnly() {
         val payload = ShareIntentPayload.from(
             options(
                 text = "Description",
@@ -29,19 +29,27 @@ class ShareIntentPayloadUnitTest {
         )
 
         assertEquals("Article title", payload.title)
-        assertEquals("https://example.com/article", payload.body)
+        assertEquals("Description\nhttps://example.com/article", payload.body)
     }
 
     @Test
-    fun textOnlyPayloadUsesTextAsTitleAndBody() {
+    fun textOnlyPayloadUsesTextAsBody() {
         val payload = ShareIntentPayload.from(options(text = "Hello"))
 
-        assertEquals("Hello", payload.title)
+        assertNull(payload.title)
         assertEquals("Hello", payload.body)
     }
 
     @Test
-    fun emptyValuesDoNotHideShareableText() {
+    fun urlOnlyPayloadUsesUrlAsBody() {
+        val payload = ShareIntentPayload.from(options(url = "https://example.com"))
+
+        assertNull(payload.title)
+        assertEquals("https://example.com", payload.body)
+    }
+
+    @Test
+    fun emptyValuesAreTreatedAsAbsent() {
         val payload = ShareIntentPayload.from(
             options(
                 text = "Hello",
@@ -50,8 +58,11 @@ class ShareIntentPayloadUnitTest {
             )
         )
 
-        assertEquals("Hello", payload.title)
+        assertNull(payload.title)
         assertEquals("Hello", payload.body)
+
+        val emptyText = ShareIntentPayload.from(options(text = "", url = "https://example.com"))
+        assertEquals("https://example.com", emptyText.body)
     }
 
     @Test

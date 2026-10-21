@@ -1,7 +1,5 @@
 package plugin.vnidrop.share
 
-import java.net.URI
-
 object ShareValidation {
     const val MAX_FILES = 16
     const val MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -49,6 +47,9 @@ object ShareValidation {
 
         for (path in filePaths) {
             validateStringLength("file path", path, MAX_FILE_PATH_BYTES)
+            if (!isValidFilePath(path)) {
+                throw SecurityException("file path must be an absolute path.")
+            }
         }
     }
 
@@ -61,7 +62,7 @@ object ShareValidation {
 
     @Throws(SecurityException::class)
     fun estimateBase64DecodedSize(data: String): Long {
-        val normalized = data.filterNot { it.isWhitespace() }
+        val normalized = stripBase64Whitespace(data)
         if (normalized.isEmpty()) return 0
         if (normalized.length % 4 != 0) {
             throw SecurityException("Invalid Base64 data.")
@@ -82,23 +83,59 @@ object ShareValidation {
         }
     }
 
-    @Throws(SecurityException::class)
-    private fun validateWebUrl(url: String) {
-        if (url.trim() != url || url.any { it.isWhitespace() || Character.isISOControl(it) }) {
-            throw SecurityException("Only well-formed http:// and https:// URLs can be shared as URLs.")
+    /** Removes the ASCII whitespace characters permitted inside Base64 data. */
+    fun stripBase64Whitespace(data: String): String =
+        data.filterNot { it == ' ' || it == '\t' || it == '\n' || it == '\r' || it == '\u000C' }
+
+    /** File paths must be non-empty absolute POSIX paths; URIs and relative paths are rejected. */
+    fun isValidFilePath(path: String): Boolean = path.startsWith("/")
+
+    /**
+     * Port of the shared (Rust) web URL check. Intentionally does not use
+     * java.net.URI / android.net.Uri so every platform agrees on the same inputs.
+     */
+    fun isValidWebUrl(url: String): Boolean {
+        if (url.any { isControlOrWhitespace(it) }) return false
+
+        val separator = url.indexOf("://")
+        if (separator < 0) return false
+        val scheme = asciiLowercase(url.substring(0, separator))
+        if (scheme != "http" && scheme != "https") return false
+
+        val rest = url.substring(separator + 3)
+        val authorityEnd = rest.indexOfFirst { it == '/' || it == '?' || it == '#' }
+        val authority = if (authorityEnd < 0) rest else rest.substring(0, authorityEnd)
+        val hostPort = authority.substringAfterLast('@')
+        val closingBracket = hostPort.indexOf(']')
+        val host = if (closingBracket >= 0) {
+            hostPort.substring(0, closingBracket + 1)
+        } else {
+            hostPort.substringBefore(':')
         }
 
-        val uri = try {
-            URI(url)
-        } catch (_: Exception) {
-            null
-        }
-        val scheme = uri?.scheme?.lowercase()
-        if (scheme != "http" && scheme != "https") {
-            throw SecurityException("Only http:// and https:// URLs can be shared as URLs.")
-        }
-        if (uri.host.isNullOrEmpty()) {
-            throw SecurityException("Only http:// and https:// URLs can be shared as URLs.")
+        return host.isNotEmpty() && host != "[]" && !host.startsWith(":")
+    }
+
+    @Throws(SecurityException::class)
+    private fun validateWebUrl(url: String) {
+        if (!isValidWebUrl(url)) {
+            throw SecurityException("Only well-formed http:// and https:// URLs can be shared as URLs.")
         }
     }
+
+    /** Unicode Cc (includes U+0080..U+009F) or Unicode White_Space. */
+    private fun isControlOrWhitespace(c: Char): Boolean {
+        if (Character.isISOControl(c)) return true
+        return when (c) {
+            ' ', '\u00A0', '\u1680', '\u2028', '\u2029', '\u202F', '\u205F', '\u3000' -> true
+            in '\u2000'..'\u200A' -> true
+            else -> false
+        }
+    }
+
+    private fun asciiLowercase(value: String): String =
+        String(CharArray(value.length) { i ->
+            val c = value[i]
+            if (c in 'A'..'Z') c + ('a' - 'A') else c
+        })
 }
