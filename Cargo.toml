@@ -7,7 +7,7 @@ authors = [ "Abass Hammed", "Vnidrop" ]
 edition = "2021"
 rust-version = "1.90"
 exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
-repository = "https://github.com/vnidrop/plugin-share"
+repository = "https://github.com/sudosylabs/plugin-share"
 links = "tauri-plugin-vnidrop-share"
 
 [dependencies]
