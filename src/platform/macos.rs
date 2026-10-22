@@ -221,6 +221,9 @@ fn show_share_picker<R: Runtime>(
         let bounds = ns_view.bounds();
         // Web-viewport coordinates are top-left origin; AppKit bounds use a bottom-left origin.
         // Flip the y-axis so the anchor rect describes the same visual area in NSView space.
+        // Without an anchor, use a 1x1 rect at the view's centre. A zero-size rect
+        // makes AppKit fall back to the whole view's bounds, which pushes the picker
+        // to the window's edge.
         let rect = options.anchor.map_or(
             CGRect {
                 origin: CGPoint {
@@ -228,8 +231,8 @@ fn show_share_picker<R: Runtime>(
                     y: bounds.size.height / 2.0,
                 },
                 size: CGSize {
-                    width: 0.0,
-                    height: 0.0,
+                    width: 1.0,
+                    height: 1.0,
                 },
             },
             |anchor| CGRect {
