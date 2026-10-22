@@ -9,6 +9,10 @@ on:
   # an already-published release tag. Run this workflow against the tag ref.
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Existing release tag to publish (for example v1.0.0-rc.3). Leave empty when running on the tag itself."
+        type: string
+        default: ""
       skip-crate:
         description: "Skip the crates.io publish (for re-running the npm publish after the crate is already out)"
         type: boolean
@@ -24,18 +28,26 @@ jobs:
       npm-tag: ${{ steps.version.outputs.npm-tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Check the tag matches the package versions
         id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            echo "::error::Run this workflow against a release tag, not $GITHUB_REF."
+          if [ -n "$INPUT_TAG" ]; then
+            tag_name="$INPUT_TAG"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_name="$GITHUB_REF_NAME"
+          else
+            echo "::error::Run this workflow against a release tag, or pass the tag input. Got $GITHUB_REF."
             exit 1
           fi
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${tag_name#v}"
           cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           npm_version="$(node -p "require('./package.json').version")"
           if [ "$tag_version" != "$cargo_version" ] || [ "$tag_version" != "$npm_version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml ($cargo_version) and package.json ($npm_version)."
+            echo "::error::Tag $tag_name does not match Cargo.toml ($cargo_version) and package.json ($npm_version)."
             exit 1
           fi
           # Prereleases go to the `next` dist-tag so `npm install` keeps resolving to a stable release.
@@ -69,6 +81,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -86,6 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -108,6 +124,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -135,6 +153,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
