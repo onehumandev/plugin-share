@@ -249,6 +249,15 @@ If a `filePath` is outside any declared root, the plugin copies it to its cache 
    }
    ```
 
+## Upgrading from 1.0.0-rc.4
+
+The version after `1.0.0-rc.4` contains breaking Rust changes.
+
+- **Rust:** `ShareOptions` includes `subject: Option<String>`. Struct literals must set `subject: None` or `Some(...)` or they will not compile.
+- **JavaScript / TypeScript:** `subject` is optional on `ShareData`; existing callers that omit it are unchanged.
+- **Android file shares:** When the chooser label must differ from the name a target uses (for example Google Drive), set `subject` to the desired filename (`file.name` or a `filePaths` basename) and use `title` for the chooser label (see the platform table above).
+- **Behavior:** If you only set `title`, Android still sets `EXTRA_SUBJECT` from `title` as before.
+
 ## Testing
 
 The repository includes Rust, JavaScript, Android JVM, iOS Swift, and example-app checks. All four validation implementations are checked against the shared cases in `tests/fixtures/validation-vectors.json`.
